@@ -1,9 +1,9 @@
 # Plesk WordPress Backup Sweeper
 
-Safely scan a **Plesk-managed server** for **web-exposed** and **non-web-exposed** WordPress backup archives and optionally **quarantine** or **permanently delete** them. Includes **space usage estimation** before and after operations.
+Safely scan a **Plesk-managed server** for **web-exposed** and **non-web-exposed** WordPress backup archives, with options to **quarantine** or **permanently delete** them. Includes **space usage estimation** before and after operations, customizable scanning paths, and production-grade safeguards.
 
 ## Features
-- **Comprehensive plugin coverage** — Detects backup files from popular WordPress backup/migration plugins:
+- **Comprehensive Plugin Coverage** — Detects backup files from popular and niche WordPress backup/migration plugins:
   - UpdraftPlus
   - All-in-One WP Migration (`.wpress`)
   - Duplicator (`.zip`, `.daf`)
@@ -17,61 +17,103 @@ Safely scan a **Plesk-managed server** for **web-exposed** and **non-web-exposed
   - Backup Migration
   - All In One Security
   - Shipper
-- **Generic risky file detection** — Finds `.zip`, `.tar`, `.wpress`, `.daf`, `.backupbuddy`, `.solidbackup`, `.sql`, `.bak`, and more.
-- **Non-web path scanning** — Can scan common backup storage outside web roots:
-  - `/var/backups`
-  - `/var/lib/psa/dumps`
-  - `/root`
-  - `/home`
-- **Dry-run by default** — Never deletes anything without explicit confirmation.
-- **Quarantine mode** — Moves files to a secure location with a manifest for restoration.
-- **Permanent delete mode** — Requires per-file confirmation tokens.
-- **Space usage estimation** — Shows disk usage before and after operation to verify space reclaimed.
-- **Structured reporting** — JSON and CSV outputs.
+- **Generic Risky File Detection** — Finds `.zip`, `.tar`, `.tgz`, `.bz2`, `.xz`, `.wpress`, `.daf`, `.backupbuddy`, `.solidbackup`, `.sql`, `.bak`, `.dump`, and more.
+- **Non-Web Path Scanning** — Scan common and custom backup storage locations outside web roots.
+- **Custom Paths** — Add extra directories to scan via `--extra-nonweb-path`.
+- **Dry-Run by Default** — No changes without explicit approval.
+- **Quarantine Mode** — Moves files to a secure, restorable location with a manifest.
+- **Permanent Delete Mode** — Requires per-file DELETE token confirmation.
+- **Space Usage Estimation** — Displays estimated and actual free space before/after.
+- **Structured Reporting** — JSON and CSV output for compliance/audit.
 
 ## Requirements
-- Python **3.10.12** or newer
+- Python **3.10.12+**
 - Linux with Plesk installed
-- No external dependencies (standard library only)
+- Standard library only (no extra dependencies)
 
 ## Installation
 ```bash
-curl -O https://raw.githubusercontent.com/<your-repo>/plesk-wp-backup-sweeper/main/plesk_wp_backup_sweeper.py
+curl -O https://raw.githubusercontent.com/securiace-dev/plesk-wp-backup-sweeper/main/plesk_wp_backup_sweeper.py
 chmod +x plesk_wp_backup_sweeper.py
 ```
 
-## Usage Examples
-**Dry-run (safe, no deletions):**
+## Usage Examples (All Combinations)
+
+### 1. Safe Audit (Web Roots Only)
 ```bash
-python3 plesk_wp_backup_sweeper.py --dry-run \
-  --report-json /root/reports/backups.json \
-  --report-csv /root/reports/backups.csv \
-  --verbose
+python3 plesk_wp_backup_sweeper.py --dry-run --verbose
 ```
 
-**Scan non-web paths as well:**
+### 2. Safe Audit (Web + Non-Web)
 ```bash
 python3 plesk_wp_backup_sweeper.py --dry-run --include-non-web
 ```
 
-**Quarantine old/large files:**
+### 3. Safe Audit (Web + Non-Web + Plesk Dumps)
+```bash
+python3 plesk_wp_backup_sweeper.py --dry-run --include-non-web --include-plesk-dumps
+```
+
+### 4. Custom Paths Only
+```bash
+python3 plesk_wp_backup_sweeper.py --dry-run --extra-nonweb-path /mnt/legacy --extra-nonweb-path /data/archives
+```
+
+### 5. Quarantine (Web Roots Only)
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --yes --age-days 7 --min-size 2M
+```
+
+### 6. Quarantine (Web + Non-Web)
 ```bash
 sudo python3 plesk_wp_backup_sweeper.py --yes --age-days 14 --min-size 5M --include-non-web
 ```
 
-**Permanently delete (dangerous):**
+### 7. Quarantine (Custom Paths)
 ```bash
-sudo python3 plesk_wp_backup_sweeper.py --permanent --age-days 30 --min-size 20M --include-non-web
+sudo python3 plesk_wp_backup_sweeper.py --yes --extra-nonweb-path /srv/backups --age-days 30 --min-size 1M
 ```
 
-**Space Usage Report:**
-The script prints a **SPACE ESTIMATE** before operations and a **SPACE AFTER ACTIONS** report once complete.
+### 8. Permanent Delete (Web Roots Only)
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --permanent --age-days 30 --min-size 10M
+```
+
+### 9. Permanent Delete (Web + Non-Web)
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --permanent --age-days 60 --min-size 50M --include-non-web
+```
+
+### 10. Permanent Delete (Custom Paths)
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --permanent --extra-nonweb-path /tmp/old --age-days 90 --min-size 100M
+```
+
+### 11. Combined Report & Quarantine
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --yes --report-json /root/reports/backups.json --report-csv /root/reports/backups.csv
+```
+
+### 12. Restore From Quarantine
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --restore /var/backup-quarantine/<timestamp>/manifest.json
+```
+
+### 13. Space Usage Only (No Action)
+```bash
+python3 plesk_wp_backup_sweeper.py --dry-run --verbose | grep "SPACE"
+```
+
+### 14. Quarantine + Include Plesk Dumps
+```bash
+sudo python3 plesk_wp_backup_sweeper.py --yes --include-plesk-dumps --age-days 15 --min-size 20M
+```
 
 ## Safety Notes
-- Default mode is **dry-run**.
-- Permanent delete mode requires **DELETE token** per file.
-- Quarantined files can be restored from the manifest.
-- Designed to be safe for production servers.
+- Always start with a **dry-run**.
+- Quarantine first; only delete permanently after verification.
+- Permanent delete requires DELETE token entry per file.
+- Space usage estimates help prevent storage overflow risks.
 
 ## License
 MIT License — see [LICENSE](LICENSE)
