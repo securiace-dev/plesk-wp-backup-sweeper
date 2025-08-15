@@ -1,0 +1,1 @@
+# plesk-wp-backup-sweeper
