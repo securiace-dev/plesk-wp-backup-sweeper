@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-plesk_wp_backup_sweeper.py (v1.2.0)
+plesk_wp_backup_sweeper.py (v1.3.0)
 
 Safely scan a Plesk-managed server for web-exposed **and non-web** WordPress backup
 archives and (optionally) quarantine or permanently delete them — with strict
-safety-first defaults.
+safety-first defaults. Now includes optional **Telegram/Discord** notifications,
+**unique server identifier + environment info** in reports, and **enhanced logs**.
 
 Python: 3.10.12
 Dependencies: Standard library only
@@ -22,20 +23,26 @@ import hashlib
 import json
 import logging
 import os
+import platform
 import re
 import shlex
 import shutil
+import socket
 import stat
 import subprocess
 import sys
+import textwrap
 import time
+import urllib.parse
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 LOGGER = logging.getLogger("plesk_wp_backup_sweeper")
+SERVER_ID = ""  # set at runtime
 
 # ------------------------------ Data structures ------------------------------
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +104,99 @@ def is_root() -> bool:
         return os.geteuid() == 0
     except AttributeError:
         return False
+
+
+# ------------------------------ Server identity -----------------------------
+
+def _read_text_first(*paths: str) -> Optional[str]:
+    for p in paths:
+        try:
+            s = Path(p).read_text(encoding="utf-8", errors="ignore").strip()
+            if s:
+                return s
+        except Exception:
+            continue
+    return None
+
+
+def compute_server_id(override: Optional[str] = None) -> str:
+    if override:
+        return override
+    # Try machine-id, then product_uuid, then hash of hostname + kernel + ips
+    material = []
+    mid = _read_text_first("/etc/machine-id", "/var/lib/dbus/machine-id")
+    if mid:
+        material.append(mid)
+    puid = _read_text_first("/sys/class/dmi/id/product_uuid")
+    if puid:
+        material.append(puid)
+    try:
+        material.append(socket.gethostname())
+    except Exception:
+        pass
+    try:
+        material.append(platform.uname().release)
+    except Exception:
+        pass
+    try:
+        # Collect IPs
+        ips = []
+        for fam in (socket.AF_INET, socket.AF_INET6):
+            try:
+                for info in socket.getaddrinfo(socket.gethostname(), None, fam):
+                    ip = info[4][0]
+                    ips.append(ip)
+            except Exception:
+                continue
+        material.extend(sorted(set(ips)))
+    except Exception:
+        pass
+    raw = "|".join(material) if material else str(time.time())
+    h = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+    return f"srv-{h}"
+
+
+def collect_env_info() -> Dict[str, str]:
+    info: Dict[str, str] = {}
+    try:
+        info["hostname"] = socket.gethostname()
+    except Exception:
+        pass
+    try:
+        info["kernel"] = platform.uname().release
+    except Exception:
+        pass
+    # OS release
+    try:
+        osr = {}
+        for line in Path("/etc/os-release").read_text(encoding="utf-8", errors="ignore").splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                osr[k.strip()] = v.strip().strip('"')
+        info["os"] = f"{osr.get('NAME','Linux')} {osr.get('VERSION','')}".strip()
+    except Exception:
+        info["os"] = "Linux"
+    # Uptime
+    try:
+        up_s = float(Path("/proc/uptime").read_text().split()[0])
+        days = int(up_s // 86400)
+        hours = int((up_s % 86400) // 3600)
+        mins = int((up_s % 3600) // 60)
+        info["uptime"] = f"{days}d {hours}h {mins}m"
+    except Exception:
+        pass
+    # Plesk version
+    for cmd in (["plesk", "version"], ["plesk", "bin", "server_pref", "--show", "-std"]):
+        rc, out, _ = run_cmd(cmd, timeout=10)
+        if rc == 0 and out:
+            m = re.search(r"(Plesk|Product version)\s*:?\s*([\w\.-]+)", out)
+            if m:
+                info["plesk"] = m.group(2)
+                break
+    info["python"] = sys.version.split()[0]
+    info["script_version"] = __version__
+    info["server_id"] = SERVER_ID
+    return info
 
 
 # --------------------------- Plesk-aware discovery ---------------------------
@@ -236,14 +336,12 @@ GENERIC_DIR_HINTS = (
 
 SENSITIVE_EXCLUDES = ("/var/lib/psa/dumps/",)
 
-# Non-web default roots (only scanned if --include-non-web)
 DEFAULT_NONWEB_GLOBS = (
     "/var/backups",
     "/var/www/vhosts/*/private",
     "/var/www/vhosts/*/files",
     "/var/www/vhosts/system/*/backup",
 )
-
 
 # ------------------------------ Risk assessment ------------------------------
 EXTENSION_WEIGHTS = {
@@ -403,8 +501,8 @@ def scan_site(site: Site, *, max_depth: int, min_size: int, age_days: int,
 def expand_glob_paths(patterns: Iterable[str]) -> List[Path]:
     out: List[Path] = []
     for pat in patterns:
-        # manual glob to avoid importing glob for simple use
-        for p in Path('/').glob(pat.lstrip('/')) if pat.startswith('/') else Path('.').glob(pat):
+        base = Path('/') if pat.startswith('/') else Path('.')
+        for p in base.glob(pat.lstrip('/')):
             try:
                 if p.exists() and p.is_dir():
                     out.append(p)
@@ -489,11 +587,9 @@ def estimate_space(findings: List[Finding], *, quarantine_root: Path, permanent:
     If same device, free space unchanged by move.
     For permanent delete: src increases by size.
     """
-    # Group by device using the first path seen as label
     dev_labels: Dict[int, str] = {}
     pre_free: Dict[int, int] = {}
 
-    # Include quarantine device in the map
     q_dev = device_id(quarantine_root)
     dev_labels[q_dev] = f"DEST:{quarantine_root}"
     pre_free[q_dev] = disk_free(quarantine_root)
@@ -504,7 +600,6 @@ def estimate_space(findings: List[Finding], *, quarantine_root: Path, permanent:
             dev_labels[d] = f"SRC:{f.path.anchor or f.site.docroot}"
             pre_free[d] = disk_free(f.path)
 
-    # Initialize post with pre
     post_free = dict(pre_free)
 
     for f in findings:
@@ -513,18 +608,66 @@ def estimate_space(findings: List[Finding], *, quarantine_root: Path, permanent:
         if permanent:
             post_free[src_dev] = post_free.get(src_dev, 0) + size
         else:
-            # quarantine action
             if src_dev == q_dev:
-                # rename within same device: no free change
                 continue
-            # cross-device copy -> src increases, dest decreases
             post_free[src_dev] = post_free.get(src_dev, 0) + size
             post_free[q_dev] = post_free.get(q_dev, 0) - size
 
-    # Convert device-indexed dicts to label-indexed for printing
     pre_labeled = {dev_labels[d]: free for d, free in pre_free.items()}
     post_labeled = {dev_labels[d]: free for d, free in post_free.items()}
     return pre_labeled, post_labeled
+
+
+# ------------------------------- Notifications -------------------------------
+class Notifier:
+    def __init__(self, *, tg_token: Optional[str], tg_chat: Optional[str], dc_webhook: Optional[str], include_logs: int, mode: str):
+        self.tg_token = tg_token
+        self.tg_chat = tg_chat
+        self.dc_webhook = dc_webhook
+        self.include_logs = max(0, int(include_logs or 0))
+        self.mode = mode  # none|always|changes|errors
+
+    def enabled(self) -> bool:
+        return bool(self.tg_token and self.tg_chat) or bool(self.dc_webhook)
+
+    def _send_telegram(self, text: str) -> None:
+        if not (self.tg_token and self.tg_chat):
+            return
+        url = f"https://api.telegram.org/bot{self.tg_token}/sendMessage"
+        data = {
+            "chat_id": self.tg_chat,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        req = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=10) as _:
+                pass
+        except Exception as e:
+            LOGGER.warning("Telegram send failed: %s", e)
+
+    def _send_discord(self, text: str) -> None:
+        if not self.dc_webhook:
+            return
+        data = json.dumps({"content": text}).encode("utf-8")
+        req = urllib.request.Request(self.dc_webhook, data=data, headers={"Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as _:
+                pass
+        except Exception as e:
+            LOGGER.warning("Discord send failed: %s", e)
+
+    def send(self, text: str) -> None:
+        # Split to satisfy platform limits
+        # Telegram: ~4096 chars; Discord: ~2000 chars
+        chunks: List[str] = []
+        max_len = 1800  # safe for both
+        for i in range(0, len(text), max_len):
+            chunks.append(text[i:i+max_len])
+        for c in chunks:
+            self._send_telegram(c)
+            self._send_discord(c)
 
 
 # --------------------------------- CLI engine --------------------------------
@@ -541,8 +684,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
     scope.add_argument("--include-plesk-dumps", action="store_true", help="Also scan /var/lib/psa/dumps (quarantine-first)")
     scope.add_argument("--include-non-web", action="store_true", help="Scan common non-web backup locations (e.g., /var/backups, vhosts private)")
     scope.add_argument("--extra-nonweb-path", action="append", default=[], help="Extra non-web base path to include (repeatable)")
-    scope.add_argument("--follow-symlinks", action="store_true", help="Follow symlinks during scan")
-    scope.add_argument("--cross-filesystems", action="store_true", help="Allow crossing filesystems during scan (best-effort)")
 
     filt = p.add_argument_group("Filters & limits")
     filt.add_argument("--min-size", default="5M", help="Ignore files smaller than this (e.g., 5M, 200K, 1G)")
@@ -575,6 +716,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     rest = p.add_argument_group("Restore")
     rest.add_argument("--restore", default=None, help="Restore files from a quarantine manifest.json")
 
+    ident = p.add_argument_group("Identity & Notifications")
+    ident.add_argument("--server-id", default=os.environ.get("SERVER_ID"), help="Override/force a specific server identifier")
+    ident.add_argument("--notify-on", choices=["none", "always", "changes", "errors"], default=os.environ.get("NOTIFY_ON", "changes"), help="When to send notifications")
+    ident.add_argument("--notify-include-logs", type=int, default=int(os.environ.get("NOTIFY_INCLUDE_LOGS", "0")), help="Include last N log lines in notifications (0=none)")
+    ident.add_argument("--telegram-bot-token", default=os.environ.get("TELEGRAM_BOT_TOKEN"))
+    ident.add_argument("--telegram-chat-id", default=os.environ.get("TELEGRAM_CHAT_ID"))
+    ident.add_argument("--discord-webhook-url", default=os.environ.get("DISCORD_WEBHOOK_URL"))
+
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return p
 
@@ -587,6 +736,19 @@ def parse_size(size_str: str) -> int:
     unit = m.group(2).upper()
     mult = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3}[unit]
     return num * mult
+
+
+# ------------------------------- Logging setup -------------------------------
+class JsonLineFileHandler(logging.FileHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            log_entry = {"ts": datetime.utcnow().isoformat() + "Z", "level": record.levelname, "msg": record.getMessage(), "server_id": SERVER_ID}
+            if isinstance(record.args, dict):
+                log_entry.update(record.args)
+        except Exception:
+            log_entry = {"ts": datetime.utcnow().isoformat() + "Z", "level": record.levelname, "msg": record.getMessage(), "server_id": SERVER_ID}
+        self.stream.write(json.dumps(log_entry) + "\n")
+        self.flush()
 
 
 def prepare_logging(args: argparse.Namespace) -> None:
@@ -610,49 +772,7 @@ def prepare_logging(args: argparse.Namespace) -> None:
         LOGGER.warning("Could not open log file %s: %s", args.log_file, e)
 
 
-class JsonLineFileHandler(logging.FileHandler):
-    def emit(self, record: logging.LogRecord) -> None:
-        try:
-            log_entry = {"ts": datetime.utcnow().isoformat() + "Z", "level": record.levelname, "msg": record.getMessage()}
-            if isinstance(record.args, dict):
-                log_entry.update(record.args)
-        except Exception:
-            log_entry = {"ts": datetime.utcnow().isoformat() + "Z", "level": record.levelname, "msg": record.getMessage()}
-        self.stream.write(json.dumps(log_entry) + "\n")
-        self.flush()
-
-
-def discover_sites(args: argparse.Namespace) -> List[Site]:
-    candidates: Dict[Tuple[str, str], Site] = {}
-    if args.auto_plesk:
-        for s in discover_sites_via_plesk_cli():
-            candidates.setdefault((s.domain, str(s.docroot)), s)
-    if args.allow_psa_db and not candidates:
-        for s in discover_sites_via_psa_db():
-            candidates.setdefault((s.domain, str(s.docroot)), s)
-    if not candidates:
-        for s in discover_sites_via_fs():
-            candidates.setdefault((s.domain, str(s.docroot)), s)
-    # Extra explicit web paths
-    for p in args.extra_path:
-        path = Path(p)
-        if path.exists() and path.is_dir():
-            label = path.parts[-2] if len(path.parts) >= 2 else path.name
-            candidates.setdefault((label, str(path)), Site(domain=label, docroot=path))
-
-    # Filter: WordPress only
-    wp_sites: List[Site] = []
-    for s in list(candidates.values()):
-        if any(ex in str(s.docroot) for ex in SENSITIVE_EXCLUDES):
-            continue
-        if s.domain in args.exclude_site:
-            continue
-        if is_wp_docroot(s.docroot):
-            wp_sites.append(s)
-    return wp_sites
-
-
-# ----------------------------------- Main ------------------------------------
+# --------------------------------- Exclusions --------------------------------
 
 def excluded_by_patterns(rel_path: str, *, globs: Sequence[str], regexes: Sequence[str]) -> bool:
     if any(fnmatch.fnmatch(rel_path, g) for g in globs):
@@ -665,6 +785,8 @@ def excluded_by_patterns(rel_path: str, *, globs: Sequence[str], regexes: Sequen
             continue
     return False
 
+
+# ---------------------------------- Actions ----------------------------------
 
 def confirm(prompt: str) -> bool:
     try:
@@ -685,6 +807,8 @@ def double_confirm_delete(fp: Path, sha256_hex: str, *, force_token: Optional[st
     typed = input("Token: ").strip()
     return typed == token
 
+
+# ---------------------------------- Restore ----------------------------------
 
 def restore_from_manifest(manifest_path: Path) -> int:
     if not manifest_path.exists():
@@ -733,12 +857,50 @@ def restore_from_manifest(manifest_path: Path) -> int:
     return 0 if errors == 0 else 3
 
 
+# ----------------------------------- Main ------------------------------------
+
+def discover_sites(args: argparse.Namespace) -> List[Site]:
+    candidates: Dict[Tuple[str, str], Site] = {}
+    if args.auto_plesk:
+        for s in discover_sites_via_plesk_cli():
+            candidates.setdefault((s.domain, str(s.docroot)), s)
+    if args.allow_psa_db and not candidates:
+        for s in discover_sites_via_psa_db():
+            candidates.setdefault((s.domain, str(s.docroot)), s)
+    if not candidates:
+        for s in discover_sites_via_fs():
+            candidates.setdefault((s.domain, str(s.docroot)), s)
+    # Extra explicit web paths
+    for p in args.extra_path:
+        path = Path(p)
+        if path.exists() and path.is_dir():
+            label = path.parts[-2] if len(path.parts) >= 2 else path.name
+            candidates.setdefault((label, str(path)), Site(domain=label, docroot=path))
+
+    # Filter: WordPress only
+    wp_sites: List[Site] = []
+    for s in list(candidates.values()):
+        if any(ex in str(s.docroot) for ex in SENSITIVE_EXCLUDES):
+            continue
+        if s.domain in args.exclude_site:
+            continue
+        if is_wp_docroot(s.docroot):
+            wp_sites.append(s)
+    return wp_sites
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    global SERVER_ID
     args = build_arg_parser().parse_args(argv)
+    SERVER_ID = compute_server_id(args.server_id)
     prepare_logging(args)
 
+    env_info = collect_env_info()
+    LOGGER.info("Server identity: %s | Host: %s | OS: %s | Kernel: %s | Plesk: %s", env_info.get("server_id"), env_info.get("hostname"), env_info.get("os"), env_info.get("kernel"), env_info.get("plesk", "?"))
+
     if args.restore:
-        return restore_from_manifest(Path(args.restore))
+        rc = restore_from_manifest(Path(args.restore))
+        return rc
 
     if (args.permanent or (args.yes and not args.dry_run)) and not is_root():
         LOGGER.error("Refusing destructive action without root privileges.")
@@ -778,7 +940,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         ]
         for fut in concurrent.futures.as_completed(futures):
             try:
-                all_findings.extend(fut.result())
+                res = fut.result()
+                all_findings.extend(res)
             except Exception as e:
                 LOGGER.error("Scan error: %s", e)
 
@@ -787,6 +950,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     for f in all_findings:
         rel = f"{f.site.domain}/{f.rel_path}"
         if excluded_by_patterns(rel, globs=args.exclude_glob, regexes=args.exclude_regex):
+            LOGGER.debug("Excluded by pattern: %s", rel)
             continue
         filtered.append(f)
 
@@ -794,10 +958,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if not filtered:
         LOGGER.info("No risky backup archives found.")
-        return 0
 
     # Console preview
-    if not args.quiet:
+    if filtered and not args.quiet:
         print("\nPotentially risky backup archives found:\n")
         print(f"{'Risk':>4}  {'Size(MB)':>8}  {'Age(d)':>6}  {'Plugin':<22}  {'Site':<38}  Path")
         now = time.time()
@@ -823,35 +986,100 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             w.writeheader(); [w.writerow(fi.to_dict()) for fi in filtered]
         LOGGER.info("Wrote CSV report: %s", outp)
 
-    # Dry-run ends here, but show space estimates as requested
+    # Space estimates (always computed, even for dry-run)
     quarantine_root = Path(args.quarantine_root)
     ensure_quarantine_root(quarantine_root)
-
     pre_free, est_post_free = estimate_space(filtered, quarantine_root=quarantine_root, permanent=args.permanent)
+
     print("\n=== SPACE ESTIMATE (assuming all listed files are acted on) ===")
-    print("Pre-operation free space:")
-    for label, free in pre_free.items():
-        print(f"  {label:35}  {free/1024/1024/1024:.2f} GiB free")
-    print("Estimated post-operation free space:")
-    for label, free in est_post_free.items():
-        print(f"  {label:35}  {free/1024/1024/1024:.2f} GiB free")
+    if pre_free:
+        print("Pre-operation free space:")
+        for label, free in pre_free.items():
+            print(f"  {label:35}  {free/1024/1024/1024:.2f} GiB free")
+    if est_post_free:
+        print("Estimated post-operation free space:")
+        for label, free in est_post_free.items():
+            print(f"  {label:35}  {free/1024/1024/1024:.2f} GiB free")
+
+    # Build notifier
+    notifier = Notifier(
+        tg_token=args.telegram_bot_token,
+        tg_chat=args.telegram_chat_id,
+        dc_webhook=args.discord_webhook_url,
+        include_logs=args.notify_include_logs,
+        mode=args.notify_on,
+    )
+
+    def should_notify(actions: int, errors: int, findings_n: int) -> bool:
+        if not notifier.enabled():
+            return False
+        if notifier.mode == "none":
+            return False
+        if notifier.mode == "always":
+            return True
+        if notifier.mode == "errors":
+            return errors > 0
+        # changes
+        return (actions > 0) or (errors > 0) or (findings_n > 0 and args.dry_run)
+
+    def render_summary(actions: int, errors: int) -> str:
+        env_lines = [
+            f"<b>Server:</b> {env_info.get('server_id')} ({env_info.get('hostname')})",
+            f"<b>OS:</b> {env_info.get('os')} | <b>Kernel:</b> {env_info.get('kernel')} | <b>Plesk:</b> {env_info.get('plesk','?')}",
+        ]
+        lines = [
+            f"<b>Plesk WP Backup Sweeper {__version__}</b>",
+            *env_lines,
+            f"<b>Mode:</b> {'DRY-RUN' if args.dry_run else ('DELETE' if args.permanent else 'QUARANTINE')}",
+            f"<b>Scan roots:</b> {len(sites)} (web={len(web_sites)}, non-web={len(nonweb_sites)})",
+            f"<b>Findings:</b> {len(filtered)}",
+            f"<b>Actions taken:</b> {actions}",
+            f"<b>Errors:</b> {errors}",
+        ]
+        if pre_free:
+            lines.append("<b>Space (GiB):</b>")
+            for label in pre_free:
+                lines.append(f"  {label}: before {pre_free[label]/1024/1024/1024:.2f} → est after {est_post_free.get(label, pre_free[label])/1024/1024/1024:.2f}")
+        # Include top matches
+        if filtered:
+            lines.append("<b>Top findings:</b>")
+            for f in filtered[:10]:
+                age_d = int((time.time() - f.mtime) / 86400.0)
+                lines.append(f"  [{f.risk}] {f.site.domain} :: {f.rel_path} ({f.size/1024/1024:.1f} MB, {age_d}d, {f.plugin or '-'})")
+        # Optional log tail
+        if notifier.include_logs > 0 and args.log_file and Path(args.log_file).exists():
+            try:
+                tail = Path(args.log_file).read_text(encoding="utf-8", errors="ignore").splitlines()[-notifier.include_logs:]
+                lines.append("<b>Log tail:</b>")
+                for ln in tail:
+                    # Escape HTML minimal
+                    ln = ln.replace("<", "&lt;").replace(">", "&gt;")
+                    lines.append(ln)
+            except Exception:
+                pass
+        return "\n".join(lines)
 
     if args.dry_run:
         LOGGER.info("Dry-run complete. No changes made.")
+        # Notify if configured
+        if should_notify(0, 0, len(filtered)):
+            notifier.send(render_summary(actions=0, errors=0))
         return 2
 
     # Prepare quarantine batch
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
-    batch_root = quarantine_root / ts
+    batch_root = Path(args.quarantine_root) / ts
     ensure_quarantine_root(batch_root)
 
     # Summary & confirmation
     total_bytes = sum(f.size for f in filtered)
     print("\n=== ACTION SUMMARY (Quarantine by default unless --permanent) ===")
     print(f"Files matched: {len(filtered)}  |  Total size: {total_bytes/1024/1024:.1f} MB")
-    if not args.yes:
+    if filtered and not args.yes:
         if not confirm("Proceed to review files one-by-one for quarantine/deletion?"):
             LOGGER.info("Aborted by user before actions.")
+            if should_notify(0, 0, len(filtered)):
+                notifier.send(render_summary(actions=0, errors=0))
             return 10
 
     manifest_records: List[Dict[str, object]] = []
@@ -892,7 +1120,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         try:
             if action == "quarantine":
-                # If cross-device, ensure destination has room for this file
                 if device_id(f.path) != device_id(batch_root) and not has_free_space(batch_root, f.size * 2):
                     LOGGER.error("Insufficient space in quarantine for %s", f.path)
                     errors += 1
@@ -916,6 +1143,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     "action": "quarantine",
                     "ts": datetime.utcnow().isoformat() + "Z",
                     "actor": getpass.getuser(),
+                    "server_id": SERVER_ID,
                 }
                 manifest_records.append(rec)
                 LOGGER.info("Quarantined: %s -> %s", f.path, qdst)
@@ -944,26 +1172,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             LOGGER.error("Failed writing manifest: %s", e)
             errors += 1
 
-    # Actual post-op space (after actions)
-    actual_pre, actual_post = estimate_space(filtered[:0], quarantine_root=quarantine_root, permanent=args.permanent)  # pre map for devices
-    # Recompute current free space for devices we printed earlier
+    # Print actual free space now
     print("\n=== SPACE AFTER ACTIONS (actual) ===")
-    seen_labels = set()
-    for label in pre_free.keys() | est_post_free.keys():
-        base = quarantine_root if label.startswith('DEST:') else Path('/')
-        # Heuristic: if DEST, measure at quarantine_root; else measure at site.docroot of first finding
-        if label.startswith('DEST:'):
+    labels = set(list(pre_free.keys()) + list(est_post_free.keys()))
+    for label in labels:
+        if label.startswith("DEST:"):
             free_now = disk_free(quarantine_root)
         else:
-            # try using the first finding's path device matching this label
             free_now = None
             for f in filtered:
-                if f"SRC:{f.path.anchor or f.site.docroot}" == label:
+                src_label = f"SRC:{f.path.anchor or f.site.docroot}"
+                if src_label == label:
                     free_now = disk_free(f.path)
                     break
             if free_now is None:
                 free_now = disk_free(Path('/'))
         print(f"  {label:35}  {free_now/1024/1024/1024:.2f} GiB free")
+
+    # Log summary
+    LOGGER.info("Summary: findings=%d acted=%d errors=%d mode=%s", len(filtered), acted, errors, "delete" if args.permanent else "quarantine")
+
+    # Notify if configured
+    if should_notify(acted, errors, len(filtered)):
+        notifier.send(render_summary(actions=acted, errors=errors))
 
     print(f"\nActions complete: acted={acted}, errors={errors}, total_matches={len(filtered)}")
     if errors:
